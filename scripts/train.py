@@ -1,0 +1,290 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import argparse
+import os
+import time
+import glob
+import sys
+from pathlib import Path
+
+# Add parent directory to sys.path for module imports
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+from model import StockLSTM
+from dataloader import StockDataset, create_time_series_splits
+from utils import TrainingLogger, TrainingReporter, ColoredProgress, TrainingProgressBar, ValidationProgressBar
+
+class Trainer:
+
+    def __init__(
+            self,
+            model,
+            train_loader,
+            val_loader,
+            criterion,
+            optimizer,
+            device,
+            checkpoint_dir,
+            args
+    ):
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.criterion = criterion
+        self.optimizer = optimizer
+        self.device = device
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.args = args
+
+        # Create checkpoint directory if it doesn't exist
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize logger and reporter
+        self.logger = TrainingLogger(args.log_dir, experiment_name=args.experiment_name)
+        self.reporter = TrainingReporter(self.checkpoint_dir.parent / args.log_dir)
+
+        # Training state
+        self.best_val_loss = float('inf')
+        self.train_losses = []
+        self.val_losses = []
+
+        # Save hyperparameters
+        self.logger.save_hyperparameters(vars(args))
+
+    def save_checkpoint(self, epoch, val_loss, is_best=False):
+        """Save model checkpoint"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'val_loss': val_loss,
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses,
+            'args': vars(self.args)
+        }
+
+        # Save epoch checkpoint
+        checkpoint_path = self.checkpoint_dir / f'checkpoint_epoch_{epoch}.pth'
+        torch.save(checkpoint, checkpoint_path)
+
+        # Save best model separately
+        if is_best:
+            best_path = self.checkpoint_dir / 'best_model.pth'
+            torch.save(checkpoint, best_path)
+            ColoredProgress.print_success(f"Best model updated at epoch {epoch} with val_loss: {val_loss:.6f}")
+        
+    def train_epoch(self, epoch):
+        """Train for one epoch"""
+        self.model.train()
+        running_loss = 0.0
+        
+        # Log epoch start
+        self.logger.log_epoch_start(epoch, self.args.epochs)
+
+        # Calculate logging interval (25% of epoch)
+        log_interval = max(1, len(self.train_loader) // 4)
+
+        epoch_start_time = time.time()
+
+        # Create progress bar
+        progress = TrainingProgressBar(self.train_loader, epoch, self.args.epochs)
+
+        with progress as pbar:
+            for batch_idx, (data, target) in pbar:
+                step_start_time = time.time()
+                
+                # Move to device
+                data, target = data.to(self.device), target.to(self.device)
+                
+                # Reshape if needed
+                if len(data.shape) == 2:
+                    data = data.unsqueeze(-1)
+                
+                # Forward pass
+                self.optimizer.zero_grad()
+                output = self.model(data)
+                loss = self.criterion(output.squeeze(), target)
+                
+                # Backward pass
+                loss.backward()
+                
+                # Gradient clipping
+                if self.args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+                
+                self.optimizer.step()
+                
+                # Update metrics
+                running_loss += loss.item()
+                avg_loss = running_loss / (batch_idx + 1)
+                step_time = time.time() - step_start_time
+                
+                # Update progress bar
+                progress.update_metrics(pbar, batch_idx, {
+                    'loss': avg_loss,
+                    'step_time': step_time
+                })
+                
+                # Log at 25% intervals
+                if (batch_idx + 1) % log_interval == 0 or batch_idx == len(self.train_loader) - 1:
+                    progress_pct = ((batch_idx + 1) / len(self.train_loader)) * 100
+                    
+                    self.logger.log_training_metrics(
+                        epoch=epoch,
+                        step=batch_idx + 1,
+                        total_steps=len(self.train_loader),
+                        metrics={
+                            'train_loss': avg_loss,
+                            'step_time_ms': step_time * 1000,
+                            'iterations_per_second': 1 / step_time
+                        }
+                    )
+                    
+                    ColoredProgress.print_info(
+                        f"[{progress_pct:.0f}% Complete] Loss: {avg_loss:.6f}"
+                    )
+        
+        epoch_time = time.time() - epoch_start_time
+        avg_epoch_loss = running_loss / len(self.train_loader)
+        
+        ColoredProgress.print_success(
+            f"Epoch {epoch} completed in {ColoredProgress.format_time(epoch_time)}"
+        )
+        
+        return avg_epoch_loss, epoch_time
+
+    def validate(self, epoch):
+        """Validate model"""
+        self.model.eval()
+        val_loss = 0.0
+        
+        progress = ValidationProgressBar(self.val_loader)
+        
+        with torch.no_grad():
+            with progress as pbar:
+                for data, target in pbar:
+                    data, target = data.to(self.device), target.to(self.device)
+                    
+                    if len(data.shape) == 2:
+                        data = data.unsqueeze(-1)
+                    
+                    output = self.model(data)
+                    loss = self.criterion(output.squeeze(), target)
+                    val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(self.val_loader)
+        
+        # Log validation metrics
+        self.logger.log_validation_metrics(epoch, {'val_loss': avg_val_loss})
+        
+        print(f"Validation Loss: {ColoredProgress.format_loss(avg_val_loss)}\n")
+        
+        return avg_val_loss
+    
+    def train(self):
+        """Main training loop"""
+        ColoredProgress.print_header("Starting Training")
+        
+        print(f"Device: {ColoredProgress.format_metric(self.device)}")
+        print(f"Epochs: {ColoredProgress.format_metric(self.args.epochs)}")
+        print(f"Batch Size: {ColoredProgress.format_metric(self.args.batch_size)}")
+        print(f"Learning Rate: {ColoredProgress.format_metric(self.args.lr)}\n")
+        
+        for epoch in range(1, self.args.epochs + 1):
+            # Train
+            train_loss, epoch_time = self.train_epoch(epoch)
+            self.train_losses.append(train_loss)
+            
+            # Validate
+            val_loss = self.validate(epoch)
+            self.val_losses.append(val_loss)
+            
+            # Log epoch end
+            self.logger.log_epoch_end(epoch, train_loss, val_loss, epoch_time)
+            
+            # Check if best model
+            is_best = val_loss < self.best_val_loss
+            if is_best:
+                self.best_val_loss = val_loss
+            
+            # Save checkpoint
+            self.save_checkpoint(epoch, val_loss, is_best)
+            
+            # Add epoch report
+            self.reporter.add_epoch_report(epoch, train_loss, val_loss, self.best_val_loss, epoch_time)
+        
+        # Save final summary
+        self.reporter.save_summary()
+        self.reporter.print_summary()
+        
+        ColoredProgress.print_header("Training Completed!")
+        ColoredProgress.print_success(f"Best Validation Loss: {self.best_val_loss:.6f}")
+
+def main():
+    parser = argparse.ArgumentParser(description='Train LSTM for Stock Prediction')
+    
+    # Data arguments
+    parser.add_argument('--data_dir', type=str, required=True)
+    parser.add_argument('--window', type=int, default=30)
+    parser.add_argument('--train_ratio', type=float, default=0.7)
+    parser.add_argument('--val_ratio', type=float, default=0.15)
+    
+    # Model arguments
+    parser.add_argument('--hidden_size', type=int, default=128)
+    parser.add_argument('--num_layers', type=int, default=2)
+    parser.add_argument('--dropout', type=float, default=0.2)
+    
+    # Training arguments
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--grad_clip', type=float, default=1.0)
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Save directories
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
+    parser.add_argument('--log_dir', type=str, default='logs')
+    parser.add_argument('--experiment_name', type=str, default='stock_lstm')
+    
+    args = parser.parse_args()
+    
+    # Load data
+    parquet_files = sorted(glob.glob(f"{args.data_dir}/*.parquet"))
+    dataset = StockDataset(parquet_files, window=args.window)
+    splits = create_time_series_splits(dataset, args.train_ratio, args.val_ratio)
+    
+    # Create dataloaders
+    train_loader = DataLoader(splits['train'], batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(splits['val'], batch_size=args.batch_size, shuffle=False)
+    
+    # Initialize model
+    model = StockLSTM(
+        input_size=1,
+        hidden_size=args.hidden_size,
+        num_layers=args.num_layers,
+        dropout=args.dropout
+    ).to(args.device)
+    
+    # Loss and optimizer
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    
+    # Train
+    trainer = Trainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        device=args.device,
+        checkpoint_dir=args.checkpoint_dir,
+        args=args
+    )
+    
+    trainer.train()
+
+
+if __name__ == '__main__':
+    main()
