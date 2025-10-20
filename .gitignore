@@ -1,0 +1,14 @@
+# Ignore model checkpoints and logs
+checkpoints/
+logs/
+
+# Ignore Python's cache folder
+__pycache__/
+
+# Ignore virtual environment folders (e.g., venv, .env)
+venv/
+.env
+
+# Ignore large data files
+*.csv
+*.zip
