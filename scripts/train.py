@@ -1,34 +1,37 @@
+# scripts/train.py (updated with normalization)
+"""
+Training script for LSTM stock prediction model
+"""
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import argparse
-import os
 import time
 import glob
 import sys
 from pathlib import Path
 
-# Add parent directory to sys.path for module imports
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+# Add parent directory to path
+current_dir = Path(__file__).parent
+parent_dir = current_dir.parent
+sys.path.insert(0, str(parent_dir))
 
-from model import StockLSTM
-from dataloader import StockDataset, create_time_series_splits
-from utils import TrainingLogger, TrainingReporter, ColoredProgress, TrainingProgressBar, ValidationProgressBar
+# Import local modules
+from scripts.model import StockLSTM
+from scripts.dataset import create_datasets_with_scaler
+from utils.logger import TrainingLogger
+from utils.reporter import TrainingReporter
+from utils.progress import ColoredProgress, TrainingProgressBar, ValidationProgressBar
+from colorama import Fore, Style
+from tqdm import tqdm
+
 
 class Trainer:
-
-    def __init__(
-            self,
-            model,
-            train_loader,
-            val_loader,
-            criterion,
-            optimizer,
-            device,
-            checkpoint_dir,
-            args
-    ):
+    """Main trainer class"""
+    
+    def __init__(self, model, train_loader, val_loader, criterion, optimizer,
+                 device, checkpoint_dir, scaler, args):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -36,23 +39,36 @@ class Trainer:
         self.optimizer = optimizer
         self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
+        self.scaler = scaler  # Store scaler for later use
         self.args = args
-
-        # Create checkpoint directory if it doesn't exist
+        
+        # Create directories
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
+        log_dir = Path(args.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
         # Initialize logger and reporter
-        self.logger = TrainingLogger(args.log_dir, experiment_name=args.experiment_name)
-        self.reporter = TrainingReporter(self.checkpoint_dir.parent / args.log_dir)
-
+        self.logger = TrainingLogger(
+            log_dir=str(log_dir),
+            experiment_name=args.experiment_name
+        )
+        self.reporter = TrainingReporter(str(log_dir))
+        
         # Training state
         self.best_val_loss = float('inf')
         self.train_losses = []
         self.val_losses = []
-
-        # Save hyperparameters
-        self.logger.save_hyperparameters(vars(args))
-
+        
+        # Save hyperparameters and scaler info
+        hyperparams = vars(args)
+        hyperparams['scaler_params'] = self.scaler.get_params()
+        self.logger.save_hyperparameters(hyperparams)
+        
+        # Save scaler
+        scaler_path = self.checkpoint_dir / 'scaler.pkl'
+        self.scaler.save(scaler_path)
+        ColoredProgress.print_success(f"Scaler saved to {scaler_path}")
+    
     def save_checkpoint(self, epoch, val_loss, is_best=False):
         """Save model checkpoint"""
         checkpoint = {
@@ -62,35 +78,36 @@ class Trainer:
             'val_loss': val_loss,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
-            'args': vars(self.args)
+            'args': vars(self.args),
+            'scaler_params': self.scaler.get_params()
         }
-
+        
         # Save epoch checkpoint
         checkpoint_path = self.checkpoint_dir / f'checkpoint_epoch_{epoch}.pth'
         torch.save(checkpoint, checkpoint_path)
-
-        # Save best model separately
+        
+        # Save best model
         if is_best:
             best_path = self.checkpoint_dir / 'best_model.pth'
             torch.save(checkpoint, best_path)
-            ColoredProgress.print_success(f"Best model updated at epoch {epoch} with val_loss: {val_loss:.6f}")
-        
+            ColoredProgress.print_success(f"Saved best model (loss: {val_loss:.6f})")
+    
     def train_epoch(self, epoch):
-        """Train for one epoch"""
+        """Train one epoch"""
         self.model.train()
         running_loss = 0.0
         
         # Log epoch start
         self.logger.log_epoch_start(epoch, self.args.epochs)
-
+        
         # Calculate logging interval (25% of epoch)
         log_interval = max(1, len(self.train_loader) // 4)
-
+        
         epoch_start_time = time.time()
-
+        
         # Create progress bar
         progress = TrainingProgressBar(self.train_loader, epoch, self.args.epochs)
-
+        
         with progress as pbar:
             for batch_idx, (data, target) in pbar:
                 step_start_time = time.time()
@@ -154,25 +171,31 @@ class Trainer:
         )
         
         return avg_epoch_loss, epoch_time
-
+    
     def validate(self, epoch):
         """Validate model"""
         self.model.eval()
         val_loss = 0.0
         
-        progress = ValidationProgressBar(self.val_loader)
+        # Simple progress bar
+        pbar = tqdm(
+            self.val_loader,
+            desc=f"{Fore.CYAN}Validating{Style.RESET_ALL}",
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}'
+        )
         
         with torch.no_grad():
-            with progress as pbar:
-                for data, target in pbar:
-                    data, target = data.to(self.device), target.to(self.device)
-                    
-                    if len(data.shape) == 2:
-                        data = data.unsqueeze(-1)
-                    
-                    output = self.model(data)
-                    loss = self.criterion(output.squeeze(), target)
-                    val_loss += loss.item()
+            for data, target in pbar:
+                data, target = data.to(self.device), target.to(self.device)
+                
+                if len(data.shape) == 2:
+                    data = data.unsqueeze(-1)
+                
+                output = self.model(data)
+                loss = self.criterion(output.squeeze(), target)
+                val_loss += loss.item()
+        
+        pbar.close()
         
         avg_val_loss = val_loss / len(self.val_loader)
         
@@ -190,7 +213,8 @@ class Trainer:
         print(f"Device: {ColoredProgress.format_metric(self.device)}")
         print(f"Epochs: {ColoredProgress.format_metric(self.args.epochs)}")
         print(f"Batch Size: {ColoredProgress.format_metric(self.args.batch_size)}")
-        print(f"Learning Rate: {ColoredProgress.format_metric(self.args.lr)}\n")
+        print(f"Learning Rate: {ColoredProgress.format_metric(self.args.lr)}")
+        print(f"Scaler Type: {ColoredProgress.format_metric(self.args.scaler_type)}\n")
         
         for epoch in range(1, self.args.epochs + 1):
             # Train
@@ -222,6 +246,7 @@ class Trainer:
         ColoredProgress.print_header("Training Completed!")
         ColoredProgress.print_success(f"Best Validation Loss: {self.best_val_loss:.6f}")
 
+
 def main():
     parser = argparse.ArgumentParser(description='Train LSTM for Stock Prediction')
     
@@ -230,6 +255,7 @@ def main():
     parser.add_argument('--window', type=int, default=30)
     parser.add_argument('--train_ratio', type=float, default=0.7)
     parser.add_argument('--val_ratio', type=float, default=0.15)
+    parser.add_argument('--scaler_type', type=str, default='minmax', choices=['minmax', 'standard'])
     
     # Model arguments
     parser.add_argument('--hidden_size', type=int, default=128)
@@ -250,14 +276,34 @@ def main():
     
     args = parser.parse_args()
     
-    # Load data
+    # Load data with proper normalization
     parquet_files = sorted(glob.glob(f"{args.data_dir}/*.parquet"))
-    dataset = StockDataset(parquet_files, window=args.window)
-    splits = create_time_series_splits(dataset, args.train_ratio, args.val_ratio)
+    
+    ColoredProgress.print_info(f"Loading data from {len(parquet_files)} parquet files...")
+    
+    data_dict = create_datasets_with_scaler(
+        parquet_files,
+        window=args.window,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        feature_cols=["('Close', 'AAPL')"],
+        scaler_type=args.scaler_type
+    )
+    
+    # Extract components
+    train_dataset = data_dict['train']
+    val_dataset = data_dict['val']
+    test_dataset = data_dict['test']
+    scaler = data_dict['scaler']
+    
+    ColoredProgress.print_success(f"Data loaded and normalized using {args.scaler_type} scaler")
+    ColoredProgress.print_info(f"Train samples: {len(train_dataset)}")
+    ColoredProgress.print_info(f"Val samples: {len(val_dataset)}")
+    ColoredProgress.print_info(f"Test samples: {len(test_dataset)}\n")
     
     # Create dataloaders
-    train_loader = DataLoader(splits['train'], batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(splits['val'], batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
     
     # Initialize model
     model = StockLSTM(
@@ -280,6 +326,7 @@ def main():
         optimizer=optimizer,
         device=args.device,
         checkpoint_dir=args.checkpoint_dir,
+        scaler=scaler,
         args=args
     )
     
