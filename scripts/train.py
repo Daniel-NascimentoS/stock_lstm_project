@@ -11,6 +11,8 @@ import time
 import glob
 import sys
 from pathlib import Path
+from colorama import Fore, Style
+from tqdm import tqdm
 
 # Add parent directory to path
 current_dir = Path(__file__).parent
@@ -23,9 +25,7 @@ from scripts.dataset import create_datasets_with_scaler
 from utils.logger import TrainingLogger
 from utils.reporter import TrainingReporter
 from utils.progress import ColoredProgress, TrainingProgressBar, ValidationProgressBar
-from colorama import Fore, Style
-from tqdm import tqdm
-
+from utils.visualizer import TrainingVisualizer
 
 class Trainer:
     """Main trainer class"""
@@ -243,6 +243,15 @@ class Trainer:
         self.reporter.save_summary()
         self.reporter.print_summary()
         
+        # Create visualizations
+        ColoredProgress.print_info("Generating training visualizations...")
+        visualizer = TrainingVisualizer(save_dir=self.args.log_dir)
+        visualizer.plot_losses(
+            self.train_losses,
+            self.val_losses,
+            title=f'{self.args.experiment_name} - Training History'
+        )
+
         ColoredProgress.print_header("Training Completed!")
         ColoredProgress.print_success(f"Best Validation Loss: {self.best_val_loss:.6f}")
 

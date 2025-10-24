@@ -4,7 +4,6 @@ import polars as pl
 import numpy as np
 import sys
 from pathlib import Path
-from colorama import Fore, Style
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -94,7 +93,7 @@ def create_time_series_splits(dataset, train_ratio=0.7, val_ratio=0.15):
 
 
 def create_datasets_with_scaler(parquet_files, window=30, train_ratio=0.7, val_ratio=0.15,
-                                feature_cols=['Close'], scaler_type='minmax'):
+                                feature_cols=["('Close', 'AAPL')"], scaler_type='minmax'):
     """
     Create train/val/test datasets with proper scaler fitting
     
