@@ -71,7 +71,7 @@ python scripts/preprocess_data.py --file data/raw/2023.parquet
 ### 3. Treinamento
 
 ```bash
-python scripts/train.py --epochs 50 --batch-size 32 --learning-rate 0.001
+python scripts/train.py --epochs 50 --batch-size 32 --lr 0.001
 ```
 
 ### 4. Visualização após estar treinado
